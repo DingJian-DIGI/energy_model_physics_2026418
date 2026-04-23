@@ -1,2 +1,0 @@
-# energy_model_physics_2026418
-电动汽车动力系统能耗计算模型

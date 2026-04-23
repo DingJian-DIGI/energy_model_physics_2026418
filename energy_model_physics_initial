@@ -1,0 +1,277 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Nov  4 14:24:40 2025
+
+@author: TLab
+"""
+
+
+import math
+from typing import Callable, Dict, Tuple, Any
+
+try:
+    import pic
+    default_power_loss_map = pic.make_power_loss_map()
+except Exception:
+    def default_power_loss_map(n_rpm: float, torque_nm: float) -> float:
+        n_term = max(n_rpm / 1000.0, 0.1)
+        t_term = abs(torque_nm) / 100.0
+        return 50.0 + 200.0 * n_term + 500.0 * (t_term ** 2)
+
+class SimpleEvPowertrainPy:
+    """
+    Python port with multi-motor support.
+    Uses "single-motor" loss map and applies it per motor.
+    """
+
+    def __init__(self,
+                 m: float,
+                 r_wheel: float,
+                 Theta: float,
+                 c_rr: float,
+                 c_d: float,
+                 A_front: float,
+                 i_gear,
+                 eta_gear: float,
+                 M_max_single: float,  # per motor
+                 P_max_single: float,  # per motor
+                 M_recup_max_single: float,
+                 P_recup_max_single: float,
+                 R_battery: float,
+                 U_battery_0: float,
+                 P_const: float = 360.0,
+                 k_speed_aux: float = 0.0,
+                 eta_regen: float = 1.0,
+                 power_loss_map=default_power_loss_map,
+                 motor_count: int = 1):  # 电机数量
+
+        self.m = float(m)
+        self.r_wheel = float(r_wheel)
+        self.Theta = float(Theta)
+        self.e_i = 1.0 + (self.Theta / (self.m * self.r_wheel * self.r_wheel))
+
+        self.c_rr = c_rr
+        self.c_d = c_d
+        self.A_front = A_front
+
+        # 允许传入 dict 或浮点作为齿比（支持多挡位）
+        self.i_gear = i_gear
+
+        self.eta_gear = eta_gear
+
+        # ------------- 电机相关（单电机额定）----------------
+        self.motor_count = motor_count
+        self.M_max_single = M_max_single
+        self.P_max_single = P_max_single
+        self.M_recup_max_single = abs(M_recup_max_single)
+        self.P_recup_max_single = abs(P_recup_max_single)
+
+        self.R_battery = R_battery
+        self.U_battery_0 = U_battery_0
+        self.P_const = P_const
+        self.k_speed_aux = k_speed_aux
+        self.eta_regen = eta_regen
+        self.power_loss_map = power_loss_map
+
+        # physics constants
+        self.g = 9.80665
+        self.rho_air = 1.225
+        self.eps = 1e-12
+
+    def _get_gear_ratio(self, gear):
+        """Allow dynamic gear ratios via a dict or single value."""
+        if isinstance(self.i_gear, dict):
+            return self.i_gear.get(gear, list(self.i_gear.values())[0])  # fallback to first gear
+        return float(self.i_gear)
+
+    def calc_power_consumption(self, dt, v, a_raw, alpha_deg, a, gear=1):
+        diagnostics = {}
+        b_stateValid = True
+
+        # 1) get correct gear ratio
+        i_gear = self._get_gear_ratio(gear)
+        diagnostics['i_gear_used'] = i_gear
+
+        # 2) mean speed
+        v_mean = v - 0.5 * a_raw * dt
+        diagnostics['v_mean'] = v_mean
+
+        # 3) Forces
+        F_a = self.m * a * self.e_i
+        F_gr = self.m * self.g * math.sin(math.radians(alpha_deg))
+        F_rr = self.m * self.g * math.cos(math.radians(alpha_deg)) * self.c_rr
+        if abs(v_mean) <= self.eps:
+            F_rr = 0.0
+
+        F_d = 0.5 * self.c_d * self.A_front * self.rho_air * v_mean ** 2
+
+        F_tractive = F_a + F_gr + F_rr + F_d
+
+        diagnostics.update(dict(F_a=F_a, F_gr=F_gr, F_rr=F_rr,
+                                F_d=F_d, F_tractive=F_tractive))
+
+        # 4) Motor speed
+        n_motor = v_mean / (2 * math.pi * self.r_wheel) * 60 * i_gear
+        omega_motor = 2 * math.pi * n_motor / 60
+        if abs(omega_motor) < self.eps:
+            omega_motor = self.eps
+
+        diagnostics['n_motor_rpm'] = n_motor
+        diagnostics['omega_motor'] = omega_motor
+
+        # 5) Total torque demand at motor shaft
+        M_total = F_tractive * self.r_wheel / i_gear
+        if F_tractive >= 0:
+            M_total /= self.eta_gear
+        else:
+            M_total *= self.eta_gear
+
+        diagnostics['M_total_initial'] = M_total
+
+        # 6) *** Split torque to each motor ***
+        M_single = M_total / self.motor_count
+        diagnostics['M_single_initial'] = M_single
+
+        # 7) Cap torque/power PER motor
+        # propulsion
+        if M_single >= 0:
+            if M_single > self.M_max_single:
+                M_single = self.M_max_single
+                b_stateValid = False
+            P_single = M_single * omega_motor
+            if P_single > self.P_max_single:
+                P_single = self.P_max_single
+                M_single = P_single / omega_motor
+                b_stateValid = False
+
+        # regen
+        else:
+            if M_single < -self.M_recup_max_single:
+                M_single = -self.M_recup_max_single
+            P_single = M_single * omega_motor
+            if P_single < -self.P_recup_max_single:
+                P_single = -self.P_recup_max_single
+                M_single = P_single / omega_motor
+
+        diagnostics['M_single_capped'] = M_single
+        diagnostics['P_single_capped'] = P_single
+
+        # 8) recompute TOTAL motor torque after limits
+        M_total_capped = M_single * self.motor_count
+        P_motor_total = M_total_capped * omega_motor
+        diagnostics['M_total_capped'] = M_total_capped
+        diagnostics['P_motor_total'] = P_motor_total
+
+        # 9) *** loss map applied to single motor, using abs for your map ***
+        try:
+            P_loss_single = float(self.power_loss_map(n_motor, M_single))
+            if math.isnan(P_loss_single):
+                P_loss_single = 0
+                b_stateValid = False
+        except:
+            P_loss_single = 0
+            b_stateValid = False
+
+        # total motor+inverter losses
+        P_loss_total = P_loss_single * self.motor_count
+        diagnostics['P_loss_total'] = P_loss_total
+
+        # 10) Battery electrical load
+        # regen efficiency: eta_regen < 1 means only part of motor-side negative power
+        # can be recovered to battery side.
+        P_motor_to_battery = P_motor_total
+        if P_motor_total < 0:
+            P_motor_to_battery = P_motor_total * self.eta_regen
+
+        # speed-dependent residual power term (used when pure constant is insufficient)
+        P_aux_residual = self.P_const + self.k_speed_aux * abs(v_mean)
+
+        P_batt_el = P_motor_to_battery + P_loss_total + P_aux_residual
+        diagnostics['P_batt_el'] = P_batt_el
+        diagnostics['P_motor_to_battery'] = P_motor_to_battery
+        diagnostics['P_aux_residual'] = P_aux_residual
+
+        # 11) Battery chemical power (same formula as SUMO)
+        U0 = self.U_battery_0
+        Ri = self.R_battery
+        discriminant = U0 * U0 - 4 * Ri * P_batt_el
+        if discriminant < 0:
+            b_stateValid = False
+            discriminant = 0
+
+        P_total = (U0 * U0) / (2 * Ri) - U0 * math.sqrt(discriminant) / (2 * Ri)
+        diagnostics['P_total'] = P_total
+
+        # 12) final energy [Wh]
+        energy_Wh = P_total * dt / 3600.0
+        diagnostics['energy_Wh'] = energy_Wh
+        diagnostics['state_valid'] = b_stateValid
+
+        return energy_Wh, P_total, b_stateValid, diagnostics, M_single
+
+
+if __name__ == "__main__":
+    import os
+    from pathlib import Path
+    import pandas as pd
+    import numpy as np
+
+    """
+    1. 自动执行预处理 
+    扫描 data 文件夹下所有的 Trip*.csv
+    """
+    import pre_process
+
+    print("正在扫描 data 文件夹并进行预处理...")
+    pre_process.main()
+
+    # 初始化 BMW i3 模型
+    bmw_i3 = SimpleEvPowertrainPy(
+        m=1417, r_wheel=0.3498, Theta=12.5, c_rr=0.007, c_d=0.29,
+        A_front=2.38, i_gear=9.665, eta_gear=0.96,
+        M_max_single=250, P_max_single=125000,
+        M_recup_max_single=77, P_recup_max_single=50000,
+        R_battery=0.0768, U_battery_0=370, P_const=360,
+        eta_regen=0.82, motor_count=1
+    )
+
+    # 自动读取所有预处理好的文件
+    data_path = Path("data")
+    processed_files = sorted(list(data_path.glob("*_processed_final.csv")))
+
+    if not processed_files:
+        print("没有找到处理后的文件，请检查 data 文件夹。")
+    else:
+        print(f"找到 {len(processed_files)} 个行程，开始批量计算...\n")
+
+        # 建立汇总列表
+        summary_list = []
+
+        for f_path in processed_files:
+            df = pd.read_csv(f_path)
+
+            # 计算预测总能耗
+            total_energy_wh = 0.0
+            for i in range(len(df)):
+                e, _, _, _, _ = bmw_i3.calc_power_consumption(
+                    dt=df.iloc[i]["dt"],
+                    v=df.iloc[i]["v_mps"],
+                    a_raw=df.iloc[i]["Acc_Recalc"],
+                    alpha_deg=df.iloc[i]["Slope_Deg"],
+                    a=df.iloc[i]["Acc_Recalc"]
+                )
+                total_energy_wh += e
+
+            # 计算实测总能耗 (根据电压电流)
+            meas_energy_wh = (df["P_batt_W"] * df["dt"]).sum() / 3600.0
+
+            # 计算准确率
+            mape = np.mean(np.abs((meas_energy_wh - total_energy_wh) / meas_energy_wh)) * 100
+
+            print(f"行程: {f_path.stem:<25} | 准确率: {100-mape:.2f}% ")
+            summary_list.append(
+                {"Trip": f_path.stem, "Predict": total_energy_wh, "Actual": meas_energy_wh, "Accuracy": 100-mape})
+
+        # 导出所有 Trip 的对比报告
+        pd.DataFrame(summary_list).to_csv("data/all_trips_comparison.csv", index=False)
+        print("\n所有行程计算完毕！汇总结果已保存至 data/all_trips_comparison.csv")
