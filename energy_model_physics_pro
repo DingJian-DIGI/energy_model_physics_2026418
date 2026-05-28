@@ -192,7 +192,7 @@ class SimpleEvPowertrainPy:
             'energy_Wh': energy_Wh, 'state_valid': b_stateValid
         })
 
-        return energy_Wh, P_total, b_stateValid, diagnostics, M_single
+        return energy_Wh, P_batt_el, b_stateValid, diagnostics, M_single
 
 
 if __name__ == "__main__":
