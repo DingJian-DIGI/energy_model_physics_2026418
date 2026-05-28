@@ -134,7 +134,7 @@ def process_trip_file(input_path: Path):
 
 def iter_trip_files(base_dir: Path):
     for path in sorted(base_dir.glob('Trip*.csv')):
-        if not path.stem.endswith('_processed_final'):
+        if not path.stem.endswith('_processed_final') and not path.stem.endswith('_power_compare'):
             yield path
 
 
